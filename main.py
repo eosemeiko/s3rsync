@@ -27,9 +27,9 @@ class S3Syncer:
         # Проверка наличия всех необходимых переменных
         required_vars = [
             'SOURCE_AWS_ACCESS_KEY_ID', 'SOURCE_AWS_SECRET_ACCESS_KEY',
-            'SOURCE_AWS_REGION', 'SOURCE_BUCKET_NAME',
+            'SOURCE_BUCKET_NAME',
             'TARGET_AWS_ACCESS_KEY_ID', 'TARGET_AWS_SECRET_ACCESS_KEY',
-            'TARGET_AWS_REGION', 'TARGET_BUCKET_NAME'
+            'TARGET_BUCKET_NAME'
         ]
 
         missing_vars = [
@@ -42,24 +42,52 @@ class S3Syncer:
             )
 
         # Создание клиента для исходного S3
-        self.source_client = boto3.client(
-            's3',
-            aws_access_key_id=os.getenv('SOURCE_AWS_ACCESS_KEY_ID'),
-            aws_secret_access_key=os.getenv(
+        source_config = {
+            'aws_access_key_id': os.getenv('SOURCE_AWS_ACCESS_KEY_ID'),
+            'aws_secret_access_key': os.getenv(
                 'SOURCE_AWS_SECRET_ACCESS_KEY'
             ),
-            region_name=os.getenv('SOURCE_AWS_REGION')
-        )
+        }
+
+        # Опциональные параметры для источника
+        if os.getenv('SOURCE_AWS_REGION'):
+            source_config['region_name'] = os.getenv('SOURCE_AWS_REGION')
+        if os.getenv('SOURCE_ENDPOINT_URL'):
+            source_config['endpoint_url'] = os.getenv('SOURCE_ENDPOINT_URL')
+        if os.getenv('SOURCE_VERIFY_SSL', 'true').lower() == 'false':
+            source_config['verify'] = False
+
+        # S3 addressing style (path/virtual)
+        if os.getenv('SOURCE_ADDRESSING_STYLE'):
+            source_config['config'] = boto3.session.Config(
+                s3={'addressing_style': os.getenv('SOURCE_ADDRESSING_STYLE')}
+            )
+
+        self.source_client = boto3.client('s3', **source_config)
 
         # Создание клиента для целевого S3
-        self.target_client = boto3.client(
-            's3',
-            aws_access_key_id=os.getenv('TARGET_AWS_ACCESS_KEY_ID'),
-            aws_secret_access_key=os.getenv(
+        target_config = {
+            'aws_access_key_id': os.getenv('TARGET_AWS_ACCESS_KEY_ID'),
+            'aws_secret_access_key': os.getenv(
                 'TARGET_AWS_SECRET_ACCESS_KEY'
             ),
-            region_name=os.getenv('TARGET_AWS_REGION')
-        )
+        }
+
+        # Опциональные параметры для назначения
+        if os.getenv('TARGET_AWS_REGION'):
+            target_config['region_name'] = os.getenv('TARGET_AWS_REGION')
+        if os.getenv('TARGET_ENDPOINT_URL'):
+            target_config['endpoint_url'] = os.getenv('TARGET_ENDPOINT_URL')
+        if os.getenv('TARGET_VERIFY_SSL', 'true').lower() == 'false':
+            target_config['verify'] = False
+
+        # S3 addressing style (path/virtual)
+        if os.getenv('TARGET_ADDRESSING_STYLE'):
+            target_config['config'] = boto3.session.Config(
+                s3={'addressing_style': os.getenv('TARGET_ADDRESSING_STYLE')}
+            )
+
+        self.target_client = boto3.client('s3', **target_config)
 
         self.source_bucket = os.getenv('SOURCE_BUCKET_NAME')
         self.target_bucket = os.getenv('TARGET_BUCKET_NAME')
@@ -180,14 +208,23 @@ class S3Syncer:
     def sync(self):
         """Основной метод синхронизации"""
         print("🚀 Начало синхронизации")
+
+        # Формирование информации об источнике
+        source_endpoint = os.getenv('SOURCE_ENDPOINT_URL', 'AWS S3')
+        source_region = os.getenv('SOURCE_AWS_REGION', 'default')
         source_msg = (
             f"📤 Источник: {self.source_bucket} "
-            f"({os.getenv('SOURCE_AWS_REGION')})"
+            f"({source_endpoint}, {source_region})"
         )
+
+        # Формирование информации о назначении
+        target_endpoint = os.getenv('TARGET_ENDPOINT_URL', 'AWS S3')
+        target_region = os.getenv('TARGET_AWS_REGION', 'default')
         target_msg = (
             f"📥 Назначение: {self.target_bucket} "
-            f"({os.getenv('TARGET_AWS_REGION')})"
+            f"({target_endpoint}, {target_region})"
         )
+
         print(source_msg)
         print(target_msg)
         print(f"🔧 Потоков: {self.max_workers}\n")
