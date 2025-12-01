@@ -10,7 +10,7 @@ import os
 import sys
 import mimetypes
 import signal
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import aioboto3
 import urllib3
@@ -136,17 +136,24 @@ class S3Syncer:
         client,
         key: str,
         source_size: int
-    ) -> bool:
-        """Проверка существования файла в целевом бакете"""
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Проверка существования файла в целевом бакете
+
+        Returns:
+            Tuple[bool, Optional[str]]: (размер_совпадает, content_type)
+        """
         try:
             response = await client.head_object(
                 Bucket=self.target_bucket,
                 Key=key
             )
-            return response['ContentLength'] == source_size
+            size_matches = response['ContentLength'] == source_size
+            current_content_type = response.get('ContentType', '')
+            return (size_matches, current_content_type)
         except ClientError as e:
             if e.response['Error']['Code'] == '404':
-                return False
+                return (False, None)
             raise
 
     async def copy_single_object(
@@ -164,20 +171,33 @@ class S3Syncer:
 
         async with self.semaphore:
             try:
-                # Проверка существования
-                if await self.check_target_exists(
+                # Определяем правильный MIME-тип по расширению
+                correct_type, _ = mimetypes.guess_type(key)
+                correct_type = (correct_type or 'application/octet-stream')
+
+                # Проверка существования и получение текущего MIME-типа
+                size_ok, current_type = await self.check_target_exists(
                     target_client, key, source_size
-                ):
-                    return (key, 'skipped')
+                )
+
+                # Пропускаем только если размер И MIME-тип правильные
+                if size_ok and current_type:
+                    # Нормализуем для сравнения
+                    current_normalized = current_type.lower().strip()
+                    correct_normalized = correct_type.lower().strip()
+
+                    # Проверяем совпадение MIME-типа
+                    if current_normalized == correct_normalized:
+                        return (key, 'skipped')
+                    # Если MIME не совпадает - перезапишем с правильным
 
                 # Защита от больших файлов в памяти
                 if source_size > MAX_FILE_SIZE_IN_MEMORY:
-                    # Для файлов > 10MB используем streaming
                     return await self._copy_large_file(
                         source_client,
                         target_client,
                         key,
-                        source_size
+                        correct_type
                     )
 
                 # Для маленьких файлов - обычное копирование
@@ -189,13 +209,10 @@ class S3Syncer:
                 # Читаем содержимое
                 body = await response['Body'].read()
 
-                # Определяем MIME-тип
-                content_type = response.get('ContentType')
-                if not content_type or content_type == 'binary/octet-stream':
-                    content_type, _ = mimetypes.guess_type(key)
-                    content_type = content_type or 'application/octet-stream'
+                # Приоритет: правильный MIME из расширения
+                content_type = correct_type
 
-                # Загружаем в целевой бакет
+                # Загружаем в целевой бакет с правильным MIME
                 await target_client.put_object(
                     Bucket=self.target_bucket,
                     Key=key,
@@ -219,23 +236,15 @@ class S3Syncer:
         source_client,
         target_client,
         key: str,
-        source_size: int
+        content_type: str
     ) -> Tuple[str, str]:
-        """Копирование больших файлов через multipart"""
+        """Копирование больших файлов (>10MB)"""
         try:
-            # Для больших файлов пропускаем (можно реализовать multipart)
-            # Пока просто копируем обычным способом с предупреждением
             response = await source_client.get_object(
                 Bucket=self.source_bucket,
                 Key=key
             )
-
             body = await response['Body'].read()
-
-            content_type = response.get('ContentType')
-            if not content_type or content_type == 'binary/octet-stream':
-                content_type, _ = mimetypes.guess_type(key)
-                content_type = content_type or 'application/octet-stream'
 
             await target_client.put_object(
                 Bucket=self.target_bucket,
@@ -247,9 +256,8 @@ class S3Syncer:
 
             del body
             return (key, 'copied')
-
         except Exception as e:
-            return (key, f"error: large file - {str(e)}")
+            return (key, f"error: {str(e)}")
 
     async def process_batch(
         self,
