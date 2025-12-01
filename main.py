@@ -10,6 +10,7 @@ import os
 import sys
 import gc
 import signal
+import mimetypes
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Iterator, Optional, Tuple
 
@@ -21,6 +22,9 @@ from tqdm import tqdm
 
 # Подавление предупреждений о непроверенных SSL сертификатах
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Инициализация базы MIME-типов
+mimetypes.init()
 
 # Константы
 CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB - размер чанка для streaming
@@ -219,6 +223,10 @@ class S3Syncer:
                 Key=key
             )
 
+            # Получаем метаданные из источника
+            source_content_type = response.get('ContentType')
+            source_metadata = response.get('Metadata', {})
+
             # Чтение содержимого в BytesIO
             # Для больших файлов читаем чанками
             file_content = io.BytesIO()
@@ -229,11 +237,30 @@ class S3Syncer:
 
             file_content.seek(0)
 
-            # Загрузка в целевой бакет
+            # Определение MIME-типа файла
+            # Приоритет: 1) тип из источника, 2) определение по расширению
+            if (source_content_type and
+                    source_content_type != 'binary/octet-stream'):
+                content_type = source_content_type
+            else:
+                content_type, _ = mimetypes.guess_type(key)
+                if content_type is None:
+                    content_type = 'application/octet-stream'
+
+            # Загрузка в целевой бакет с указанием MIME-типа
+            extra_args = {
+                'ContentType': content_type
+            }
+
+            # Копируем метаданные из источника, если они есть
+            if source_metadata:
+                extra_args['Metadata'] = source_metadata
+
             self.target_client.upload_fileobj(
                 file_content,
                 self.target_bucket,
-                key
+                key,
+                ExtraArgs=extra_args
             )
 
             # Явная очистка памяти
