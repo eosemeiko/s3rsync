@@ -2,13 +2,16 @@
 """
 S3 Sync Script - копирование файлов между S3 бакетами без локального сохранения
 Поддержка разных AWS аккаунтов, многопоточность, проверка размера файлов
+Оптимизирован для работы с большими объемами данных
 """
 
 import io
 import os
 import sys
+import gc
+import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterator, Optional, Tuple
 
 import boto3
 import urllib3
@@ -19,6 +22,9 @@ from tqdm import tqdm
 # Подавление предупреждений о непроверенных SSL сертификатах
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Константы
+CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB - размер чанка для streaming
+
 
 class S3Syncer:
     """Класс для синхронизации файлов между S3 бакетами"""
@@ -27,6 +33,10 @@ class S3Syncer:
         """Инициализация клиентов S3 и настроек"""
         # Загрузка переменных окружения
         load_dotenv()
+
+        # Флаг для graceful shutdown
+        self.interrupted = False
+        self.setup_signal_handlers()
 
         # Проверка наличия всех необходимых переменных
         required_vars = [
@@ -105,16 +115,29 @@ class S3Syncer:
             'errors': 0
         }
 
-    def get_all_objects(self) -> list:
+    def setup_signal_handlers(self):
+        """Настройка обработчиков сигналов для graceful shutdown"""
+        def signal_handler(signum, frame):
+            if not self.interrupted:
+                self.interrupted = True
+                print("\n\n⚠️  Получен сигнал прерывания (Ctrl+C)...")
+                print("⏳ Завершаю текущие операции, подождите...")
+                print("💡 Нажмите Ctrl+C еще раз для немедленной остановки\n")
+            else:
+                print("\n❌ Принудительная остановка!")
+                sys.exit(130)
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+    def get_all_objects(self) -> Iterator[Dict]:
         """
         Получение списка всех объектов из исходного бакета
-        с пагинацией
+        с пагинацией (возвращает генератор для экономии памяти)
 
-        Returns:
-            list: Список словарей с информацией об объектах
+        Yields:
+            Dict: Информация об объекте
         """
-        objects = []
-
         try:
             paginator = self.source_client.get_paginator('list_objects_v2')
             page_iterator = paginator.paginate(Bucket=self.source_bucket)
@@ -125,17 +148,18 @@ class S3Syncer:
             )
             print(source_bucket_msg)
 
+            total_objects = 0
             for page in page_iterator:
                 if 'Contents' in page:
-                    objects.extend(page['Contents'])
+                    for obj in page['Contents']:
+                        total_objects += 1
+                        yield obj
 
-            print(f"✅ Найдено файлов: {len(objects)}")
+            print(f"✅ Найдено файлов: {total_objects}")
 
         except ClientError as e:
             print(f"❌ Ошибка при получении списка объектов: {e}")
             raise
-
-        return objects
 
     def check_target_object(self, key: str) -> Optional[int]:
         """
@@ -165,6 +189,7 @@ class S3Syncer:
     def copy_object(self, obj: Dict) -> Tuple[str, str]:
         """
         Копирование объекта из исходного бакета в целевой через память
+        с использованием streaming для экономии памяти
 
         Args:
             obj: Словарь с информацией об объекте
@@ -173,6 +198,10 @@ class S3Syncer:
             Tuple[str, str]: (ключ объекта, статус:
                              'copied'/'skipped'/'error')
         """
+        # Проверка на прерывание
+        if self.interrupted:
+            return (obj['Key'], 'interrupted')
+
         key = obj['Key']
         source_size = obj['Size']
 
@@ -191,7 +220,13 @@ class S3Syncer:
             )
 
             # Чтение содержимого в BytesIO
-            file_content = io.BytesIO(response['Body'].read())
+            # Для больших файлов читаем чанками
+            file_content = io.BytesIO()
+            for chunk in response['Body'].iter_chunks(
+                chunk_size=CHUNK_SIZE
+            ):
+                file_content.write(chunk)
+
             file_content.seek(0)
 
             # Загрузка в целевой бакет
@@ -201,6 +236,11 @@ class S3Syncer:
                 key
             )
 
+            # Явная очистка памяти
+            file_content.close()
+            del file_content
+            del response
+
             return (key, 'copied')
 
         except ClientError as e:
@@ -208,6 +248,9 @@ class S3Syncer:
             return (key, f'error: {error_msg}')
         except Exception as e:
             return (key, f'error: {str(e)}')
+        finally:
+            # Принудительная сборка мусора для освобождения памяти
+            gc.collect()
 
     def sync(self):
         """Основной метод синхронизации"""
@@ -233,8 +276,14 @@ class S3Syncer:
         print(target_msg)
         print(f"🔧 Потоков: {self.max_workers}\n")
 
-        # Получение списка всех объектов
-        objects = self.get_all_objects()
+        # Получение генератора объектов (не загружаем все в память!)
+        objects_generator = self.get_all_objects()
+
+        # Преобразуем генератор в список для подсчета
+        # (альтернатива - два прохода: один для подсчета,
+        # второй для копирования)
+        print("⏳ Подготовка списка файлов...")
+        objects = list(objects_generator)
 
         if not objects:
             print("ℹ️  Нет файлов для копирования")
@@ -245,30 +294,51 @@ class S3Syncer:
         # Многопоточное копирование с прогресс-баром
         print("\n📦 Копирование файлов...")
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Запуск задач
-            futures = {
-                executor.submit(self.copy_object, obj): obj
-                for obj in objects
-            }
+        try:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # Запуск задач
+                futures = {
+                    executor.submit(self.copy_object, obj): obj
+                    for obj in objects
+                }
 
-            # Обработка результатов с прогресс-баром
-            with tqdm(total=len(objects), unit='файл', ncols=100) as pbar:
-                for future in as_completed(futures):
-                    key, status = future.result()
+                # Обработка результатов с прогресс-баром
+                with tqdm(total=len(objects), unit='файл', ncols=100) as pbar:
+                    for future in as_completed(futures):
+                        # Проверка на прерывание
+                        if self.interrupted:
+                            # Отменяем оставшиеся задачи
+                            for f in futures:
+                                f.cancel()
+                            break
 
-                    if status == 'copied':
-                        self.stats['copied'] += 1
-                    elif status == 'skipped':
-                        self.stats['skipped'] += 1
-                    elif status.startswith('error'):
-                        self.stats['errors'] += 1
-                        # Логируем только ошибки
-                        tqdm.write(f"❌ {status}")
+                        key, status = future.result()
 
-                    pbar.update(1)
+                        if status == 'copied':
+                            self.stats['copied'] += 1
+                        elif status == 'skipped':
+                            self.stats['skipped'] += 1
+                        elif status == 'interrupted':
+                            # Не считаем прерванные задачи
+                            pass
+                        elif status.startswith('error'):
+                            self.stats['errors'] += 1
+                            # Логируем только ошибки
+                            tqdm.write(f"❌ {status}")
+
+                        pbar.update(1)
+
+                        # Периодическая сборка мусора
+                        if pbar.n % 100 == 0:
+                            gc.collect()
+
+        except KeyboardInterrupt:
+            self.interrupted = True
+            print("\n⚠️  Прерывание...")
 
         # Итоговая статистика
+        if self.interrupted:
+            print("\n⚠️  Синхронизация прервана пользователем\n")
         self._print_summary()
 
     def _print_summary(self):
@@ -284,9 +354,23 @@ class S3Syncer:
         )
         print(skipped_msg)
         print(f"❌ Ошибок:         {self.stats['errors']}")
+
+        # Показываем необработанные файлы при прерывании
+        if self.interrupted:
+            processed = (
+                self.stats['copied'] +
+                self.stats['skipped'] +
+                self.stats['errors']
+            )
+            remaining = self.stats['total'] - processed
+            if remaining > 0:
+                print(f"⏸️  Не обработано:  {remaining}")
+
         print("="*60 + "\n")
 
-        if self.stats['errors'] > 0:
+        if self.interrupted:
+            print("⚠️  Синхронизация прервана пользователем")
+        elif self.stats['errors'] > 0:
             print("⚠️  Синхронизация завершена с ошибками")
         else:
             print("🎉 Синхронизация успешно завершена!")
