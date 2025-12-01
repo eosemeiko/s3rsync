@@ -11,9 +11,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional, Tuple
 
 import boto3
+import urllib3
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from tqdm import tqdm
+
+# Подавление предупреждений о непроверенных SSL сертификатах
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class S3Syncer:
